@@ -252,6 +252,7 @@ namespace {
     AlignedHeapStartMap AlignedHeapStarts, ZeroInitStarts;
     GlobalAddressMap GlobalAddresses;
     NameSet Externals; // vars
+    NameSet ExternalFuncs; // vars
     NameSet Declares; // funcs
     StringMap Redirects; // library function redirects actually used, needed for wrapper funcs in tables
     std::vector<std::string> Relocations;
@@ -265,9 +266,14 @@ namespace {
     BlockAddressMap BlockAddresses;
     std::map<std::string, AsmConstInfo> AsmConsts; // code => { index, list of seen sigs }
     std::map<std::string, std::string> EmJsFunctions; // name => code
-    NameSet FuncRelocatableExterns; // which externals are accessed in this function; we load them once at the beginning (avoids a potential call in a heap access, and might be faster)
+    // which externals are accessed in this function; we load them once at the
+    // beginning (avoids a potential call in a heap access, and might be faster)
+    NameSet FuncRelocatableExterns;
+    NameSet FuncRelocatableExternFunctions;
     std::vector<std::string> ExtraFunctions;
-    std::set<const Function*> DeclaresNeedingTypeDeclarations; // list of declared funcs whose type we must declare asm.js-style with a usage, as they may not have another usage
+    // list of declared funcs whose type we must declare asm.js-style with a
+    // usage, as they may not have another usage
+    std::set<const Function*> DeclaresNeedingTypeDeclarations;
 
     struct {
       // 0 is reserved for void type
@@ -658,7 +664,7 @@ namespace {
     }
 
     // Return a constant we are about to write into a global as a numeric offset. If the
-    // value is not known at compile time, emit a postSet to that location.
+    // value is not known at compile time, emit a relocation to that location.
     unsigned getConstAsOffset(const Value *V, unsigned AbsoluteTarget) {
       V = resolveFully(V);
       if (const Function *F = dyn_cast<const Function>(V)) {
@@ -673,8 +679,8 @@ namespace {
       } else {
         if (const GlobalVariable *GV = dyn_cast<GlobalVariable>(V)) {
           if (!GV->hasInitializer()) {
-            // We don't have a constant to emit here, so we must emit a postSet
-            // All postsets are of external values, so they are pointers, hence 32-bit
+            // We don't have a constant to emit here, so we must emit a
+            // relocation
             std::string Name = getOpName(V);
             Externals.insert(Name);
             UsesInt32Array = true;
@@ -687,14 +693,14 @@ namespace {
             } else {
               Relocations.push_back("\n HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2] = " + Name + ';');
             }
-            return 0; // emit zero in there for now, until the postSet
+            return 0; // emit zero in there for now, until the relocation
           } else if (Relocatable) {
             UsesInt32Array = true;
             // this is one of our globals, but we must relocate it. we return zero, but the caller may store
-            // an added offset, which we read at postSet time; in other words, we just add to that offset
+            // an added offset, which we read at relocation time; in other words, we just add to that offset
             std::string access = "HEAP32[" + relocateGlobal(utostr(AbsoluteTarget)) + " >> 2]";
             Relocations.push_back("\n " + access + " = (" + access + " | 0) + " + relocateGlobal(utostr(getGlobalAddress(V->getName().str()))) + ';');
-            return 0; // emit zero in there for now, until the postSet
+            return 0; // emit zero in there for now, until the relocation
           }
         }
         assert(!Relocatable);
@@ -973,7 +979,7 @@ namespace {
 
     // special analyses
 
-    bool canReloop(const Function *F);
+    //bool canReloop(const Function *F);
 
     // main entry point
 
@@ -1248,10 +1254,6 @@ const char *SIMDType(VectorType *t, bool signedIntegerType = true) {
 
 std::string JSWriter::getCast(const StringRef &s, Type *t, AsmCast sign) {
   switch (t->getTypeID()) {
-    default: {
-      errs() << *t << "\n";
-      assert(false && "Unsupported type");
-    }
     case Type::VectorTyID:
       return std::string("SIMD_") + SIMDType(cast<VectorType>(t)) + "_check(" + s.str() + ")";
     case Type::FloatTyID: {
@@ -1264,21 +1266,26 @@ std::string JSWriter::getCast(const StringRef &s, Type *t, AsmCast sign) {
         }
       }
       // otherwise fall through to double
+      LLVM_FALLTHROUGH;
     }
     case Type::DoubleTyID: return ("+" + s).str();
     case Type::IntegerTyID: {
       // fall through to the end for nonspecific
       switch (t->getIntegerBitWidth()) {
-        case 1:  if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&1").str()     : (s + "<<31>>31").str();
-        case 8:  if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&255").str()   : (s + "<<24>>24").str();
-        case 16: if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&65535").str() : (s + "<<16>>16").str();
-        case 32: return (sign == ASM_SIGNED || (sign & ASM_NONSPECIFIC) ? s + "|0" : s + ">>>0").str();
+        case 1:  if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&1").str()     : (s + "<<31>>31").str(); LLVM_FALLTHROUGH;
+        case 8:  if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&255").str()   : (s + "<<24>>24").str(); LLVM_FALLTHROUGH;
+        case 16: if (!(sign & ASM_NONSPECIFIC)) return sign == ASM_UNSIGNED ? (s + "&65535").str() : (s + "<<16>>16").str(); LLVM_FALLTHROUGH;
+        case 32: return (sign == ASM_SIGNED || (sign & ASM_NONSPECIFIC) ? s + "|0" : s + ">>>0").str(); LLVM_FALLTHROUGH;
         case 64: return ("i64(" + s + ")").str();
         default: llvm_unreachable("Unsupported integer cast bitwidth");
       }
     }
     case Type::PointerTyID:
       return (sign == ASM_SIGNED || (sign & ASM_NONSPECIFIC) ? s + "|0" : s + ">>>0").str();
+    default: {
+      errs() << *t << "\n";
+      llvm_unreachable("Unsupported type");
+    }
   }
 }
 
@@ -1853,6 +1860,15 @@ std::string JSWriter::getConstant(const Constant* CV, AsmCast sign) {
   if (isa<ConstantPointerNull>(CV)) return "0";
 
   if (const Function *F = dyn_cast<Function>(CV)) {
+    if (!F->isDSOLocal() && Relocatable) {
+      std::string Name = getOpName(F) + '$' + getFunctionSignature(F->getFunctionType());
+      ExternalFuncs.insert(Name);
+      // we access linked function addresses through calls, which we load at the beginning of basic blocks
+      FuncRelocatableExternFunctions.insert(Name);
+      Name = "t$" + Name;
+      UsedVars[Name] = i32;
+      return Name;
+    }
     return relocateFunctionPointer(utostr(getFunctionIndex(F)));
   }
 
@@ -3512,6 +3528,7 @@ void JSWriter::printFunctionBody(const Function *F) {
             break;
           }
           // otherwise fall through to double
+          LLVM_FALLTHROUGH;
         case Type::DoubleTyID:
           Out << "+0";
           break;
@@ -3560,6 +3577,14 @@ void JSWriter::printFunctionBody(const Function *F) {
         Out << Temp + " = " + Call + "() | 0;\n";
       }
       FuncRelocatableExterns.clear();
+    }
+    if (FuncRelocatableExternFunctions.size() > 0) {
+      for (auto& RE : FuncRelocatableExternFunctions) {
+        std::string Temp = "t$" + RE;
+        std::string Call = "fp$" + RE;
+        Out << Temp + " = " + Call + "() | 0;\n";
+      }
+      FuncRelocatableExternFunctions.clear();
     }
   }
 
@@ -3950,6 +3975,19 @@ void JSWriter::printModuleBody() {
   Out << "\"externs\": [";
   first = true;
   for (NameSet::const_iterator I = Externals.begin(), E = Externals.end();
+       I != E; ++I) {
+    if (first) {
+      first = false;
+    } else {
+      Out << ", ";
+    }
+    Out << "\"" << *I << "\"";
+  }
+  Out << "],";
+
+  Out << "\"externFunctions\": [";
+  first = true;
+  for (NameSet::const_iterator I = ExternalFuncs.begin(), E = ExternalFuncs.end();
        I != E; ++I) {
     if (first) {
       first = false;
@@ -4653,9 +4691,11 @@ void JSWriter::calculateNativizedVars(const Function *F) {
 
 // special analyses
 
+/*
 bool JSWriter::canReloop(const Function *F) {
   return true;
 }
+*/
 
 // main entry
 
