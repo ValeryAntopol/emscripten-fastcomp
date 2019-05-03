@@ -636,6 +636,78 @@ namespace {
       return V;
     }
 
+    uint64_t calcTypeSizeBytes(const Type *type) {
+      if (!type->isAggregateType()) {
+        uint64_t bits = type->getPrimitiveSizeInBits();
+        return bits / 8 + (bits % 8 > 0 ? 1 : 0);
+      }
+
+      if (const StructType *structType = dyn_cast<StructType>(type)) {
+        uint64_t size = 0;
+        for (const Type *subtype : type->subtypes()) {
+          size += calcTypeSizeBytes(subtype);
+        }
+
+        return size;
+      }
+
+      if (const SequentialType *sequentialType = dyn_cast<SequentialType>(type)) {
+        return calcTypeSizeBytes(sequentialType->getElementType()) * sequentialType->getNumElements();
+      }
+    }
+
+    std::string extractString(const Value *V) {
+      if (const Instruction *CI = dyn_cast<Instruction>(V)) {
+        // This is more complicated case:
+        // var1 = aclloca i8*
+        // store GEP(...) to var1
+        // var2 = load from var1
+        // call emscripten_asm_const...(var2, ...)
+
+        if (isa<LoadInst>(CI)) {
+          V = CI->getOperand(0);
+        }
+
+        for (const User *CU : V->users()) {
+          if (const StoreInst *CSI = dyn_cast<StoreInst>(CU)) {
+            V = CSI->getOperand(0);
+            break;
+          }
+        }
+      }
+
+      // CE expected to be GEP
+      if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(V)) {
+        const Constant *C = CE->getOperand(0);
+        Type *T = C->getType();
+        C = cast<Constant>(resolveFully(C));
+        const GlobalVariable *CGB = cast<GlobalVariable>(C);
+        uint64_t offset = 0;
+        for (int nOP = 1; nOP < CE->getNumOperands(); ++nOP) {
+          uint64_t index = cast<ConstantInt>(CE->getOperand(nOP))->getZExtValue();
+          for (int elementIndex = 0; elementIndex < index; ++elementIndex) {
+            Type *ST = T->getContainedType(elementIndex);
+            offset += calcTypeSizeBytes(ST);
+          }
+
+          T = T->getContainedType(index);
+        }
+
+        const ConstantData *CI = cast<ConstantData>(CGB->getInitializer());
+        DUMP(CI);
+        std::string code = " ";
+        if (const ConstantDataSequential *CDS =
+                dyn_cast<ConstantDataSequential>(CI)) {
+          StringRef data = CDS->getRawDataValues();
+          code = {data.data() + offset};
+        }
+
+        return code;
+      }
+
+      return " ";
+    }
+
     std::string relocateFunctionPointer(std::string FP) {
       if (Relocatable && WebAssembly && SideModule) {
         return "(__table_base + (" + FP + ") | 0)";
@@ -733,15 +805,7 @@ namespace {
     // into an id. We emit a map of id => string contents, and emscripten
     // wraps it up so that calling that id calls that function.
     unsigned getAsmConstId(const Value *V, std::string CallTypeFunc, std::string Sig) {
-      V = resolveFully(V);
-      const Constant *CI = cast<GlobalVariable>(V)->getInitializer();
-      std::string code;
-      if (isa<ConstantAggregateZero>(CI)) {
-        code = " ";
-      } else {
-        const ConstantDataSequential *CDS = cast<ConstantDataSequential>(CI);
-        code = escapeCode(CDS->getAsString());
-      }
+      std::string code = escapeCode(extractString(V));
       unsigned Id;
       if (AsmConsts.count(code) > 0) {
         auto& Info = AsmConsts[code];
